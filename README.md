@@ -2,6 +2,8 @@
 
 A Streamlit dashboard for analysing the Black Desert Online EU Central Market, focused on Cooking and Alchemy items.
 
+![Dashboard Screenshot](images/screenshot.png)
+
 ## Quick Start
 
 ### 1. Clone / Open in PyCharm
