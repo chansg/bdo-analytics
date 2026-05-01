@@ -23,9 +23,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from api.market import (
     clear_cache,
     get_cooking_items,
+    get_data_status,
     get_hot_items,
     get_item_history,
-    is_using_live_data,
 )
 from analytics.best_sellers import enrich_items
 
@@ -53,8 +53,6 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-    st.caption(f"Last refreshed: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
     with st.expander("ℹ️ Score Definitions"):
         st.markdown(
             """
@@ -64,7 +62,7 @@ Higher = more popular.
 
 **Price Stability (0–100)**
 Based on the coefficient of variation of recent prices.
-Higher = more predictable pricing.
+Higher = more predictable pricing. Blank means price history is unavailable.
 
 **Turnover Rate**
 Current stock ÷ average daily volume.
@@ -78,7 +76,8 @@ Weighted composite:
 
 **Anomaly Flag**
 True when the current price deviates > 2 standard deviations
-from its 30-day moving average — could signal a crash or spike.
+from its 30-day moving average. "Insufficient history" means the dashboard
+does not have enough historical prices to make that call yet.
 """
         )
 
@@ -114,18 +113,54 @@ def load_item_history(item_id: int) -> dict:
     return get_item_history(item_id)
 
 
+def _latest_fetch_time(*statuses: dict) -> str:
+    """
+    Return the latest available fetch timestamp from status dictionaries.
+
+    This is more accurate than showing the current page render time because
+    Streamlit may reuse cached data without making a fresh API call.
+    """
+    fetched_at_values = [status.get("fetched_at") for status in statuses if status.get("fetched_at")]
+    if not fetched_at_values:
+        return "No cached data yet"
+    return max(fetched_at_values)
+
+
+def _show_data_status(*statuses: dict) -> None:
+    """
+    Show whether the dashboard is using live data or mock fallback data.
+
+    The API layer stores this metadata whenever it writes cache files.
+    """
+    sources = {status.get("source") for status in statuses}
+    if "live" in sources:
+        st.success("🟢 LIVE — data sourced from arsha.io", icon="🟢")
+    elif "mock" in sources:
+        st.warning("🟡 MOCK — using offline sample data", icon="🟡")
+    else:
+        st.info("Data source will appear after the first load.")
+
+    errors = [status.get("error") for status in statuses if status.get("error")]
+    if errors:
+        with st.expander("Latest API fallback details"):
+            for error in errors:
+                st.code(error)
+
+
 # ---------------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------------
 st.title("BDO Market Intelligence — EU")
 st.caption("Cooking & Alchemy · Live Data via arsha.io")
 
-# Data source indicator
-live = is_using_live_data("hot_items") or is_using_live_data("cooking_items")
-if live:
-    st.success("🟢 LIVE — data sourced from arsha.io", icon="🟢")
-else:
-    st.warning("🟡 MOCK — using offline sample data", icon="🟡")
+# Load the two main datasets before showing source status. This keeps the
+# LIVE/MOCK badge tied to the actual data on screen.
+hot_df = load_hot_items()
+cook_df = load_cooking_items()
+hot_status = get_data_status("hot_items")
+cooking_status = get_data_status("cooking_items")
+_show_data_status(hot_status, cooking_status)
+st.sidebar.caption(f"Last data fetch: {_latest_fetch_time(hot_status, cooking_status)}")
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +172,6 @@ tab_hot, tab_cooking, tab_history = st.tabs(
 
 # ----- Tab 1: Hot Items Leaderboard ----------------------------------------
 with tab_hot:
-    hot_df = load_hot_items()
     if hot_df.empty:
         st.info("No hot-item data available.")
     else:
@@ -148,23 +182,30 @@ with tab_hot:
         display.insert(0, "Rank", range(1, len(display) + 1))
 
         # Pick columns that exist
-        cols_wanted = ["Rank", "name", "mainCategory", "minPrice", "tradeCount", "anomaly"]
+        cols_wanted = [
+            "Rank",
+            "name",
+            "mainCategoryName",
+            "minPrice",
+            "tradeCount",
+            "anomalyStatus",
+        ]
         cols_present = [c for c in cols_wanted if c in display.columns]
         display = display[cols_present]
 
         # Rename for readability
         rename_map = {
             "name": "Item Name",
-            "mainCategory": "Category",
+            "mainCategoryName": "Category",
             "minPrice": "Current Price",
             "tradeCount": "Trade Count",
-            "anomaly": "Anomaly",
+            "anomalyStatus": "Anomaly Status",
         }
         display = display.rename(columns=rename_map)
 
         # Highlight anomaly rows
         def _highlight_anomaly(row):
-            if row.get("Anomaly"):
+            if row.get("Anomaly Status") == "Anomaly":
                 return ["background-color: #fff3cd"] * len(row)
             return [""] * len(row)
 
@@ -174,7 +215,6 @@ with tab_hot:
 
 # ----- Tab 2: Cooking / Alchemy Browser -----------------------------------
 with tab_cooking:
-    cook_df = load_cooking_items()
     if cook_df.empty:
         st.info("No Cooking / Alchemy data available.")
     else:
@@ -188,7 +228,7 @@ with tab_cooking:
         # Columns for display
         cols_wanted = [
             "name", "minPrice", "volumeScore", "priceStability",
-            "turnoverRate", "bestSellerScore", "anomaly",
+            "turnoverRate", "bestSellerScore", "anomalyStatus",
         ]
         cols_present = [c for c in cols_wanted if c in cook_df.columns]
         display = cook_df[cols_present].copy()
@@ -200,7 +240,7 @@ with tab_cooking:
             "priceStability": "Price Stability",
             "turnoverRate": "Turnover Rate",
             "bestSellerScore": "Best Seller Score",
-            "anomaly": "Anomaly",
+            "anomalyStatus": "Anomaly Status",
         }
         display = display.rename(columns=rename_map)
 
@@ -221,12 +261,14 @@ with tab_cooking:
         styled = display.style
         if "Best Seller Score" in display.columns:
             styled = styled.map(_colour_score, subset=["Best Seller Score"])
+        if "Price Stability" in display.columns:
+            styled = styled.format({"Price Stability": "{:.2f}"}, na_rep="N/A")
         st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
 # ----- Tab 3: Price History ------------------------------------------------
 with tab_history:
-    cook_all = load_cooking_items()
+    cook_all = cook_df
     if cook_all.empty or "name" not in cook_all.columns:
         st.info("No items available for price history.")
     else:
