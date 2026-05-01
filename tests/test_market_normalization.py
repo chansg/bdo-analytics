@@ -7,7 +7,9 @@ APP_ROOT = PROJECT_ROOT / "bdo-intelligence"
 sys.path.insert(0, str(APP_ROOT))
 
 from api.market import (  # noqa: E402
+    _apply_item_category_index,
     _history_from_v1_result,
+    _infer_category_from_name,
     _normalize_item,
     _normalize_items,
     summarize_data_health,
@@ -53,6 +55,64 @@ def test_normalize_items_deduplicates_same_item_and_enhancement_level():
 
     assert len(normalized) == 1
     assert normalized[0]["id"] == 100
+
+
+def test_apply_item_category_index_enriches_unknown_hot_item_category():
+    """Hot items without category data should use the category lookup."""
+    items = [
+        {
+            "id": 4468,
+            "name": "Red Crystal",
+            "mainCategory": 0,
+            "mainCategoryName": "Unknown",
+            "subCategory": 0,
+        }
+    ]
+    category_index = {
+        "4468": {
+            "mainCategory": 50,
+            "mainCategoryName": "Magic Crystal",
+            "subCategory": 1,
+        }
+    }
+
+    enriched = _apply_item_category_index(items, category_index)
+
+    assert enriched[0]["mainCategory"] == 50
+    assert enriched[0]["mainCategoryName"] == "Magic Crystal"
+    assert enriched[0]["subCategory"] == 1
+
+
+def test_apply_item_category_index_keeps_known_categories():
+    """Existing category names should not be overwritten by the lookup."""
+    items = [
+        {
+            "id": 9213,
+            "name": "Beer",
+            "mainCategory": 35,
+            "mainCategoryName": "Cooking",
+            "subCategory": 1,
+        }
+    ]
+    category_index = {
+        "9213": {
+            "mainCategory": 35,
+            "mainCategoryName": "Consumable",
+            "subCategory": 1,
+        }
+    }
+
+    enriched = _apply_item_category_index(items, category_index)
+
+    assert enriched[0]["mainCategoryName"] == "Cooking"
+
+
+def test_infer_category_from_name_handles_hot_item_edge_cases():
+    """Clear item-name patterns should avoid an Unknown category label."""
+    assert _infer_category_from_name("Special Hot Pepper Seed")["mainCategoryName"] == "Seed / Hypha"
+    assert _infer_category_from_name("Balenos Fishing Rod")["mainCategoryName"] == "Fishing Gear"
+    assert _infer_category_from_name("[Donkey] Shabby Leather Barding")["mainCategoryName"] == "Mount Gear"
+    assert _infer_category_from_name("Forest Path Wagon Flag")["mainCategoryName"] == "Wagon Part"
 
 
 def test_history_from_v1_result_builds_date_price_mapping():

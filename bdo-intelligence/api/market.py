@@ -27,15 +27,39 @@ ARSHA_BASE_URL = "https://api.arsha.io"
 REGION = "eu"
 LANGUAGE = "en"
 REQUEST_TIMEOUT_SECONDS = 20
+MAX_SUBCATEGORY_SCAN = 30
 
 # BDO category IDs
 COOKING_MAIN_CATEGORY = "35"   # Cooking in arsha.io V2 category mapping
 ALCHEMY_MAIN_CATEGORY = "45"   # Alchemy
+MARKET_MAIN_CATEGORIES = {
+    "1": "Main Weapon",
+    "5": "Sub-Weapon",
+    "10": "Awakening Weapon",
+    "15": "Armor",
+    "20": "Accessory",
+    "25": "Material",
+    "30": "Enhancement",
+    "35": "Consumable",
+    "40": "Life Tool",
+    "45": "Alchemy Stone",
+    "50": "Magic Crystal",
+    "55": "Pearl Item",
+    "60": "Dye",
+    "65": "Pet",
+    "70": "Ship",
+    "75": "Wagon",
+    "80": "Furniture",
+    "85": "Lightstone",
+}
 CRAFTING_CATEGORY_SUBCATEGORIES = {
     COOKING_MAIN_CATEGORY: ("1", "2", "3"),
     ALCHEMY_MAIN_CATEGORY: ("1", "2", "3"),
 }
 CATEGORY_NAMES = {
+    **MARKET_MAIN_CATEGORIES,
+    # These labels are used for the focused browser view. They are intentionally
+    # more player-friendly than the broad Central Market category names.
     COOKING_MAIN_CATEGORY: "Cooking",
     ALCHEMY_MAIN_CATEGORY: "Alchemy",
 }
@@ -409,6 +433,105 @@ def _normalize_items(
     return list(deduped.values())
 
 
+def _apply_item_category_index(
+    items: list[dict[str, Any]],
+    category_index: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Fill missing category information from an item-id lookup.
+
+    The Hot Items endpoint returns item prices and trade counts, but it does not
+    include the Central Market category. The category index comes from the
+    regular market list endpoint and lets the Hot Items table show useful names
+    instead of ``Unknown``.
+    """
+    enriched = []
+    for item in items:
+        updated = item.copy()
+        metadata = category_index.get(str(item.get("id")))
+        if metadata and updated.get("mainCategoryName") == "Unknown":
+            updated["mainCategory"] = metadata["mainCategory"]
+            updated["mainCategoryName"] = metadata["mainCategoryName"]
+            updated["subCategory"] = metadata["subCategory"]
+        elif updated.get("mainCategoryName") == "Unknown":
+            updated.update(_infer_category_from_name(str(updated.get("name", ""))))
+        enriched.append(updated)
+    return enriched
+
+
+def _infer_category_from_name(name: str) -> dict[str, Any]:
+    """
+    Infer a useful category for obvious item names not present in the index.
+
+    This is a last-resort display helper. The live API remains the source of
+    truth when it provides category metadata, but a few hot-list items such as
+    seeds and wagon parts do not appear in the category scan.
+    """
+    lowered = name.lower()
+    if "seed" in lowered or "hypha" in lowered:
+        return {"mainCategory": 25, "mainCategoryName": "Seed / Hypha", "subCategory": 0}
+    if "fishing rod" in lowered or "float" in lowered:
+        return {"mainCategory": 40, "mainCategoryName": "Fishing Gear", "subCategory": 0}
+    if name.startswith("[Donkey]") or name.startswith("[Horse]"):
+        return {"mainCategory": 65, "mainCategoryName": "Mount Gear", "subCategory": 0}
+    if "wagon" in lowered:
+        return {"mainCategory": 75, "mainCategoryName": "Wagon Part", "subCategory": 0}
+    return {"mainCategory": 0, "mainCategoryName": "Unknown", "subCategory": 0}
+
+
+def _build_item_category_index(target_ids: set[int]) -> dict[str, dict[str, Any]]:
+    """
+    Build or refresh an item-id-to-category lookup for specific item IDs.
+
+    This is intentionally cached because scanning Central Market categories
+    requires several API calls. The scan stops early once all requested hot-item
+    IDs have been found.
+    """
+    cache_key = "item_category_index"
+    cached = _read_cache(cache_key)
+    category_index: dict[str, dict[str, Any]] = cached if isinstance(cached, dict) else {}
+
+    missing_ids = {item_id for item_id in target_ids if str(item_id) not in category_index}
+    if not missing_ids:
+        return category_index
+
+    for main_category, category_name in MARKET_MAIN_CATEGORIES.items():
+        for sub_category in range(1, MAX_SUBCATEGORY_SCAN + 1):
+            try:
+                url = _build_url(
+                    f"/v2/{REGION}/GetWorldMarketList",
+                    {
+                        "mainCategory": main_category,
+                        "subCategory": sub_category,
+                        "lang": LANGUAGE,
+                    },
+                )
+                data = _read_json_url(url)
+            except ArshaApiError:
+                # Some category/subcategory combinations do not exist. That is
+                # normal while scanning, so skip them quietly.
+                continue
+
+            items = data if isinstance(data, list) else [data]
+            for raw_item in items:
+                item_id = _to_int(_first_value(_as_dict(raw_item), ("id", "itemId", "item_id")))
+                if item_id == 0:
+                    continue
+                category_index[str(item_id)] = {
+                    "mainCategory": _to_int(main_category),
+                    "mainCategoryName": category_name,
+                    "subCategory": sub_category,
+                }
+                missing_ids.discard(item_id)
+
+            if not missing_ids:
+                _write_cache(cache_key, category_index, source="live")
+                return category_index
+
+    _write_cache(cache_key, category_index, source="live")
+    return category_index
+
+
 def _normalize_history(data: Any, item_id: int, source: str) -> dict[str, Any]:
     """Normalize supported price-history payload shapes into ``history``."""
     if data is None:
@@ -527,8 +650,11 @@ async def _fetch_hot_items() -> list[dict]:
         items = data if isinstance(data, list) else [data]
         normalized = _normalize_items(items, source="live")
         if normalized:
-            _write_cache(cache_key, normalized, source="live")
-            return normalized
+            target_ids = {item["id"] for item in normalized if item.get("id")}
+            category_index = _build_item_category_index(target_ids)
+            enriched = _apply_item_category_index(normalized, category_index)
+            _write_cache(cache_key, enriched, source="live")
+            return enriched
         error = "Live API returned no hot-item content."
     except Exception as exc:
         # Keep the dashboard usable, but record the error so it is visible in
