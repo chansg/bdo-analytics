@@ -6,7 +6,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 APP_ROOT = PROJECT_ROOT / "bdo-intelligence"
 sys.path.insert(0, str(APP_ROOT))
 
-from api.market import _history_from_v1_result, _normalize_item, _normalize_items  # noqa: E402
+from api.market import (  # noqa: E402
+    _history_from_v1_result,
+    _normalize_item,
+    _normalize_items,
+    summarize_data_health,
+)
 
 
 def test_normalize_item_maps_common_api_aliases():
@@ -59,3 +64,42 @@ def test_history_from_v1_result_builds_date_price_mapping():
     assert history["_mock"] is False
     assert history["itemId"] == 9213
     assert list(history["history"].values()) == [100, 110, 120]
+
+
+def test_data_health_is_live_when_all_loaded_endpoints_are_live():
+    """The top banner should show LIVE only when every loaded endpoint is live."""
+    health = summarize_data_health(
+        [
+            {"source": "live", "error": None},
+            {"source": "live", "error": None},
+        ]
+    )
+
+    assert health["state"] == "LIVE"
+    assert health["icon"] == "🟢"
+
+
+def test_data_health_is_partial_live_when_sources_are_mixed():
+    """Mixed live/mock sources should be labelled as partial live."""
+    health = summarize_data_health(
+        [
+            {"source": "live", "error": None},
+            {"source": "mock", "error": "Arsha endpoint unavailable"},
+        ]
+    )
+
+    assert health["state"] == "PARTIAL LIVE"
+    assert health["icon"] == "🟠"
+
+
+def test_data_health_is_mock_when_all_loaded_endpoints_are_mock():
+    """The banner should say MOCK when every loaded endpoint is fallback data."""
+    health = summarize_data_health(
+        [
+            {"source": "mock", "error": "Arsha endpoint unavailable"},
+            {"source": "mock", "error": "Arsha endpoint unavailable"},
+        ]
+    )
+
+    assert health["state"] == "MOCK"
+    assert health["icon"] == "🟡"

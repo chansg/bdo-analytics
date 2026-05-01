@@ -38,6 +38,7 @@ from api.market import (
     get_data_status,
     get_hot_items,
     get_item_history,
+    summarize_data_health,
 )
 from analytics.best_sellers import enrich_items
 
@@ -138,25 +139,58 @@ def _latest_fetch_time(*statuses: dict) -> str:
     return max(fetched_at_values)
 
 
-def _show_data_status(*statuses: dict) -> None:
+def _status_label(source: str) -> str:
+    """
+    Convert the cached source value into a short UI label.
+
+    Keeping this in one helper means the banner, health table, and future pages
+    use the same wording.
+    """
+    labels = {
+        "live": "Live",
+        "mock": "Mock fallback",
+        "unknown": "Not loaded",
+    }
+    return labels.get(source, str(source).title())
+
+
+def _show_data_status(endpoint_statuses: list[dict]) -> None:
     """
     Show whether the dashboard is using live data or mock fallback data.
 
     The API layer stores this metadata whenever it writes cache files.
     """
-    sources = {status.get("source") for status in statuses}
-    if "live" in sources:
-        st.success("LIVE — data sourced from arsha.io", icon="🟢")
-    elif "mock" in sources:
-        st.warning("MOCK — using offline sample data", icon="🟡")
+    health = summarize_data_health(endpoint_statuses)
+    banner_text = f"{health['state']} — {health['message']}"
+    if health["state"] == "LIVE":
+        st.success(banner_text, icon=health["icon"])
+    elif health["state"] in {"PARTIAL LIVE", "MOCK"}:
+        st.warning(banner_text, icon=health["icon"])
     else:
-        st.info("Data source will appear after the first load.")
+        st.info(banner_text, icon=health["icon"])
 
-    errors = [status.get("error") for status in statuses if status.get("error")]
-    if errors:
-        with st.expander("Latest API fallback details"):
-            for error in errors:
-                st.code(error)
+    with st.expander("Data Health", expanded=health["state"] != "LIVE"):
+        rows = []
+        for status in endpoint_statuses:
+            rows.append(
+                {
+                    "Endpoint": status["label"],
+                    "Status": _status_label(status.get("source", "unknown")),
+                    "Last Fetch": status.get("fetched_at") or "N/A",
+                    "Fallback Detail": status.get("error") or "N/A",
+                }
+            )
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+
+def _format_styled_table(styled, formatters: dict) -> object:
+    """
+    Apply consistent table formatting.
+
+    The dashboard tables are easier to scan when silver values use commas,
+    scores use two decimals, and missing values display as N/A.
+    """
+    return styled.format(formatters, na_rep="N/A")
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +205,11 @@ hot_df = load_hot_items()
 cook_df = load_cooking_items()
 hot_status = get_data_status("hot_items")
 cooking_status = get_data_status("cooking_items")
-_show_data_status(hot_status, cooking_status)
+endpoint_statuses = [
+    {"label": "Hot Items", **hot_status},
+    {"label": "Cooking / Alchemy", **cooking_status},
+]
+_show_data_status(endpoint_statuses)
 st.sidebar.caption(f"Last data fetch: {_latest_fetch_time(hot_status, cooking_status)}")
 
 
@@ -222,6 +260,13 @@ with tab_hot:
             return [""] * len(row)
 
         styled = display.style.apply(_highlight_anomaly, axis=1)
+        styled = _format_styled_table(
+            styled,
+            {
+                "Current Price": "{:,.0f}",
+                "Trade Count": "{:,.0f}",
+            },
+        )
         st.dataframe(styled, width="stretch", hide_index=True)
 
 
@@ -273,8 +318,16 @@ with tab_cooking:
         styled = display.style
         if "Best Seller Score" in display.columns:
             styled = styled.map(_colour_score, subset=["Best Seller Score"])
-        if "Price Stability" in display.columns:
-            styled = styled.format({"Price Stability": "{:.2f}"}, na_rep="N/A")
+        styled = _format_styled_table(
+            styled,
+            {
+                "Price": "{:,.0f}",
+                "Volume Score": "{:.2f}",
+                "Price Stability": "{:.2f}",
+                "Turnover Rate": "{:.2f}",
+                "Best Seller Score": "{:.2f}",
+            },
+        )
         st.dataframe(styled, width="stretch", hide_index=True)
 
 

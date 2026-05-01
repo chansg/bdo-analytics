@@ -180,6 +180,49 @@ def get_data_status(key: str) -> dict[str, Any]:
     }
 
 
+def summarize_data_health(statuses: list[dict[str, Any]]) -> dict[str, Any]:
+    """
+    Summarize several endpoint statuses into one dashboard health state.
+
+    A single banner that says only LIVE or MOCK can be misleading. For example,
+    Cooking/Alchemy category data may be live while Hot Items is using mock
+    fallback because the upstream endpoint is blocked. This helper makes that
+    mixed state explicit.
+    """
+    known_statuses = [status for status in statuses if status.get("source") != "unknown"]
+    if not known_statuses:
+        return {
+            "state": "UNKNOWN",
+            "message": "Data source will appear after the first load.",
+            "icon": "ℹ️",
+        }
+
+    sources = {status.get("source") for status in known_statuses}
+    if sources == {"live"}:
+        return {
+            "state": "LIVE",
+            "message": "All loaded endpoints are live via arsha.io.",
+            "icon": "🟢",
+        }
+    if "live" in sources and "mock" in sources:
+        return {
+            "state": "PARTIAL LIVE",
+            "message": "Some endpoints are live; unavailable endpoints are using fallback data.",
+            "icon": "🟠",
+        }
+    if sources == {"mock"}:
+        return {
+            "state": "MOCK",
+            "message": "Using offline sample data because live endpoints are unavailable.",
+            "icon": "🟡",
+        }
+    return {
+        "state": "PARTIAL DATA",
+        "message": "Some endpoint statuses are incomplete.",
+        "icon": "ℹ️",
+    }
+
+
 def _contains_mock_data(data: Any) -> bool:
     """Return True when cached data carries the mock sentinel."""
     if isinstance(data, dict):
