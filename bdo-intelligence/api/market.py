@@ -10,9 +10,12 @@ import asyncio
 import json
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -20,6 +23,10 @@ from typing import Any, Optional
 
 CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "cache"
 CACHE_TTL_SECONDS = 15 * 60  # 15 minutes
+ARSHA_BASE_URL = "https://api.arsha.io"
+REGION = "eu"
+LANGUAGE = "en"
+REQUEST_TIMEOUT_SECONDS = 20
 
 # BDO category IDs
 COOKING_MAIN_CATEGORY = "35"   # Cooking in arsha.io V2 category mapping
@@ -34,6 +41,10 @@ CATEGORY_NAMES = {
 }
 
 LOGGER = logging.getLogger(__name__)
+
+
+class ArshaApiError(RuntimeError):
+    """Raised when the public Arsha API returns an error response."""
 
 # ---------------------------------------------------------------------------
 # Cache helpers
@@ -106,7 +117,7 @@ def _write_cache(
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     wrapper = {
         "cached_at": time.time(),
-        "fetched_at": datetime.utcnow().isoformat(timespec="seconds"),
+        "fetched_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "source": source,
         "error": error,
         "data": data,
@@ -208,6 +219,84 @@ def _to_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _build_url(path: str, params: Optional[dict[str, Any]] = None) -> str:
+    """
+    Build an Arsha API URL with optional query parameters.
+
+    Keeping URL construction in one helper makes it easier to change region,
+    language, or endpoint paths later.
+    """
+    query = f"?{urlencode(params)}" if params else ""
+    return f"{ARSHA_BASE_URL}{path}{query}"
+
+
+def _read_json_url(url: str) -> Any:
+    """
+    Read JSON from a public Arsha API URL.
+
+    Arsha does not require an API key. If the upstream BDO source is blocked or
+    returns invalid data, Arsha usually responds with a JSON error body. This
+    helper turns that into a short exception message that the app can display.
+    """
+    request = Request(url, headers={"User-Agent": "bdo-analytics/phase-1"})
+    try:
+        with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+            body = response.read().decode("utf-8")
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise ArshaApiError(_format_arsha_error(exc.code, body)) from exc
+    except URLError as exc:
+        raise ArshaApiError(f"Could not reach Arsha API: {exc.reason}") from exc
+
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise ArshaApiError("Arsha API returned a non-JSON response.") from exc
+
+
+def _format_arsha_error(status_code: int, body: str) -> str:
+    """
+    Convert an Arsha error response into a readable dashboard message.
+
+    Example: the API may return 500 with a message saying the upstream request
+    was probably blocked by Imperva. That is not an API key problem.
+    """
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return f"Arsha API returned HTTP {status_code}."
+
+    message = payload.get("message", "No message")
+    code = payload.get("code")
+    if code:
+        return f"Arsha API returned HTTP {status_code} (code {code}): {message}"
+    return f"Arsha API returned HTTP {status_code}: {message}"
+
+
+def _history_from_v1_result(data: Any, item_id: int, source: str) -> dict[str, Any]:
+    """
+    Convert the v1 history alias into the dashboard's date-to-price mapping.
+
+    The v1 endpoint returns one hyphen-separated price per day, oldest first.
+    Arsha currently documents this as roughly 90 days of history.
+    """
+    if not isinstance(data, dict) or data.get("resultCode") != 0:
+        return _normalize_history(data, item_id=item_id, source=source)
+
+    prices = [
+        _to_int(price)
+        for price in str(data.get("resultMsg", "")).split("-")
+        if price
+    ]
+    today = datetime.now(UTC).date()
+    start_date = today - timedelta(days=len(prices) - 1)
+    history = {
+        (start_date + timedelta(days=index)).isoformat(): price
+        for index, price in enumerate(prices)
+    }
+    return {"_mock": source == "mock", "history": history, "itemId": item_id}
+
+
 def _normalize_item(
     item: Any,
     *,
@@ -279,6 +368,9 @@ def _normalize_items(
 
 def _normalize_history(data: Any, item_id: int, source: str) -> dict[str, Any]:
     """Normalize supported price-history payload shapes into ``history``."""
+    if data is None:
+        return {"_mock": source == "mock", "history": {}, "itemId": item_id}
+
     if isinstance(data, dict) and "history" in data:
         return {**data, "_mock": source == "mock" or bool(data.get("_mock")), "itemId": item_id}
 
@@ -355,7 +447,7 @@ def _mock_item_history(item_id: int) -> dict:
 
     base_price = (item_id % 10000) * 200 + 500
     history = {}
-    today = datetime.utcnow().date()
+    today = datetime.now(UTC).date()
     for days_ago in range(90, -1, -1):
         date = today - timedelta(days=days_ago)
         # Simulate ±15% daily fluctuation
@@ -384,28 +476,22 @@ async def _fetch_hot_items() -> list[dict]:
         return cached
 
     try:
-        from bdomarket import ArshaMarket, MarketRegion, ApiVersion, Locale
-
-        async with ArshaMarket(
-            region=MarketRegion.EU,
-            apiversion=ApiVersion.V2,
-            language=Locale.English,
-        ) as market:
-            response = await market.get_world_market_hot_list()
-
-        if response.success and response.content:
-            data = response.content if isinstance(response.content, list) else [response.content]
-            normalized = _normalize_items(data, source="live")
+        url = _build_url(
+            f"/v2/{REGION}/GetWorldMarketHotList",
+            {"lang": LANGUAGE},
+        )
+        data = _read_json_url(url)
+        items = data if isinstance(data, list) else [data]
+        normalized = _normalize_items(items, source="live")
+        if normalized:
             _write_cache(cache_key, normalized, source="live")
             return normalized
+        error = "Live API returned no hot-item content."
     except Exception as exc:
         # Keep the dashboard usable, but record the error so it is visible in
         # the UI and useful while debugging API or network issues.
         error = f"{type(exc).__name__}: {exc}"
-        LOGGER.warning("Failed to fetch hot items from arsha.io: %s", error)
-    else:
-        error = "Live API returned no hot-item content."
-        LOGGER.warning(error)
+        LOGGER.debug("Failed to fetch hot items from arsha.io: %s", error)
 
     # Fallback: mock data
     mock = _normalize_items(_mock_hot_items(), source="mock")
@@ -426,43 +512,46 @@ async def _fetch_cooking_items() -> list[dict]:
         return cached
 
     try:
-        from bdomarket import ArshaMarket, MarketRegion, ApiVersion, Locale
-
         combined: list[dict] = []
-        async with ArshaMarket(
-            region=MarketRegion.EU,
-            apiversion=ApiVersion.V2,
-            language=Locale.English,
-        ) as market:
-            # Fetch a small configured set of useful subcategories rather than
-            # only subcategory 1. This gives a broader Cooking/Alchemy view
-            # while keeping the number of API calls controlled.
-            for cat, sub_categories in CRAFTING_CATEGORY_SUBCATEGORIES.items():
-                for sub_category in sub_categories:
-                    resp = await market.get_world_market_list(
-                        main_category=cat,
-                        sub_category=sub_category,
+        # Fetch a small configured set of useful subcategories rather than
+        # only subcategory 1. This gives a broader Cooking/Alchemy view while
+        # keeping the number of API calls controlled.
+        for cat, sub_categories in CRAFTING_CATEGORY_SUBCATEGORIES.items():
+            for sub_category in sub_categories:
+                try:
+                    url = _build_url(
+                        f"/v2/{REGION}/GetWorldMarketList",
+                        {
+                            "mainCategory": cat,
+                            "subCategory": sub_category,
+                            "lang": LANGUAGE,
+                        },
                     )
-                    if resp.success and resp.content:
-                        items = resp.content if isinstance(resp.content, list) else [resp.content]
-                        combined.extend(
-                            _normalize_items(
-                                items,
-                                source="live",
-                                category_id=cat,
-                                sub_category_id=sub_category,
-                            )
+                    data = _read_json_url(url)
+                    items = data if isinstance(data, list) else [data]
+                    combined.extend(
+                        _normalize_items(
+                            items,
+                            source="live",
+                            category_id=cat,
+                            sub_category_id=sub_category,
                         )
+                    )
+                except Exception as exc:
+                    LOGGER.debug(
+                        "Skipping category %s, subcategory %s: %s",
+                        cat,
+                        sub_category,
+                        exc,
+                    )
 
         if combined:
             _write_cache(cache_key, combined, source="live")
             return combined
+        error = "Live API returned no Cooking/Alchemy content for the configured subcategories."
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
-        LOGGER.warning("Failed to fetch Cooking/Alchemy items from arsha.io: %s", error)
-    else:
-        error = "Live API returned no Cooking/Alchemy content."
-        LOGGER.warning(error)
+        LOGGER.debug("Failed to fetch Cooking/Alchemy items from arsha.io: %s", error)
 
     mock = _normalize_items(_mock_cooking_items(), source="mock")
     _write_cache(cache_key, mock, source="mock", error=error)
@@ -486,29 +575,18 @@ async def _fetch_item_history(item_id: int, enhancement_level: int = 0) -> dict:
         return cached
 
     try:
-        from bdomarket import ArshaMarket, MarketRegion, ApiVersion, Locale
-
-        async with ArshaMarket(
-            region=MarketRegion.EU,
-            apiversion=ApiVersion.V2,
-            language=Locale.English,
-        ) as market:
-            resp = await market.get_market_price_info(
-                ids=[str(item_id)],
-                sids=[str(enhancement_level)],
-                convertdate=True,
-            )
-
-        if resp.success and resp.content:
-            data = _normalize_history(resp.content, item_id=item_id, source="live")
+        url = _build_url(
+            f"/v1/{REGION}/history",
+            {"id": item_id, "sid": enhancement_level},
+        )
+        data = _history_from_v1_result(_read_json_url(url), item_id=item_id, source="live")
+        if data.get("history"):
             _write_cache(cache_key, data, source="live")
             return data
+        error = f"Live API returned no price-history content for item {item_id}."
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
-        LOGGER.warning("Failed to fetch item history from arsha.io: %s", error)
-    else:
-        error = f"Live API returned no price-history content for item {item_id}."
-        LOGGER.warning(error)
+        LOGGER.debug("Failed to fetch item history from arsha.io: %s", error)
 
     mock = _normalize_history(_mock_item_history(item_id), item_id=item_id, source="mock")
     _write_cache(cache_key, mock, source="mock", error=error)

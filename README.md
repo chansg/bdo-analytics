@@ -32,11 +32,16 @@ pip install -r requirements.txt
 ### 4. Run the Dashboard
 
 ```bash
-cd bdo-intelligence
+# From the project root (bdo-analytics/)
 streamlit run app.py
 ```
 
 The dashboard will open in your browser at `http://localhost:8501`.
+
+> Note: Streamlit apps should be started with `streamlit run`, not
+> `python app.py`. If `python app.py` is used by mistake, the launcher prints
+> the correct command and exits without the long Streamlit runtime warning
+> output.
 
 ## Features
 
@@ -62,6 +67,9 @@ All data comes from [arsha.io](https://arsha.io), a community-maintained proxy f
 
 - API responses are cached locally for 15 minutes (in `data/cache/`)
 - If arsha.io is unreachable, the dashboard falls back to realistic mock data so you can still explore the interface
+- Some live EU endpoints can temporarily fail when Pearl Abyss blocks upstream
+  requests through Imperva. This is an upstream data-source issue, not a missing
+  API key.
 
 ## Project Structure
 
