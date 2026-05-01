@@ -14,11 +14,23 @@ from pathlib import Path
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from streamlit.runtime.scriptrunner import get_script_run_ctx
 
 # ---------------------------------------------------------------------------
 # Ensure local packages are importable when running via `streamlit run app.py`
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# Streamlit apps need to be launched by Streamlit, not plain Python.
+# Without this guard, `python app.py` produces a long list of internal
+# Streamlit runtime warnings that are confusing while learning the project.
+if get_script_run_ctx(suppress_warning=True) is None:
+    print("\nThis is a Streamlit dashboard.")
+    print("Start it with this command instead:\n")
+    print("    streamlit run app.py\n")
+    print("If you are in the project root, use:")
+    print("    streamlit run bdo-intelligence/app.py\n")
+    sys.exit(0)
 
 from api.market import (
     clear_cache,
@@ -134,9 +146,9 @@ def _show_data_status(*statuses: dict) -> None:
     """
     sources = {status.get("source") for status in statuses}
     if "live" in sources:
-        st.success("🟢 LIVE — data sourced from arsha.io", icon="🟢")
+        st.success("LIVE — data sourced from arsha.io", icon="🟢")
     elif "mock" in sources:
-        st.warning("🟡 MOCK — using offline sample data", icon="🟡")
+        st.warning("MOCK — using offline sample data", icon="🟡")
     else:
         st.info("Data source will appear after the first load.")
 
@@ -210,7 +222,7 @@ with tab_hot:
             return [""] * len(row)
 
         styled = display.style.apply(_highlight_anomaly, axis=1)
-        st.dataframe(styled, use_container_width=True, hide_index=True)
+        st.dataframe(styled, width="stretch", hide_index=True)
 
 
 # ----- Tab 2: Cooking / Alchemy Browser -----------------------------------
@@ -263,7 +275,7 @@ with tab_cooking:
             styled = styled.map(_colour_score, subset=["Best Seller Score"])
         if "Price Stability" in display.columns:
             styled = styled.format({"Price Stability": "{:.2f}"}, na_rep="N/A")
-        st.dataframe(styled, use_container_width=True, hide_index=True)
+        st.dataframe(styled, width="stretch", hide_index=True)
 
 
 # ----- Tab 3: Price History ------------------------------------------------
@@ -329,4 +341,4 @@ with tab_history:
                 hovermode="x unified",
                 template="plotly_white",
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")

@@ -6,7 +6,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 APP_ROOT = PROJECT_ROOT / "bdo-intelligence"
 sys.path.insert(0, str(APP_ROOT))
 
-from api.market import _normalize_item, _normalize_items  # noqa: E402
+from api.market import _history_from_v1_result, _normalize_item, _normalize_items  # noqa: E402
 
 
 def test_normalize_item_maps_common_api_aliases():
@@ -48,3 +48,14 @@ def test_normalize_items_deduplicates_same_item_and_enhancement_level():
 
     assert len(normalized) == 1
     assert normalized[0]["id"] == 100
+
+
+def test_history_from_v1_result_builds_date_price_mapping():
+    """The v1 history alias should become the chart-friendly history shape."""
+    payload = {"resultCode": 0, "resultMsg": "100-110-120"}
+
+    history = _history_from_v1_result(payload, item_id=9213, source="live")
+
+    assert history["_mock"] is False
+    assert history["itemId"] == 9213
+    assert list(history["history"].values()) == [100, 110, 120]
