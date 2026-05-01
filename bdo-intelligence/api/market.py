@@ -8,7 +8,7 @@ If the API is unreachable, realistic mock data is returned instead.
 
 import asyncio
 import json
-import os
+import logging
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -24,6 +24,16 @@ CACHE_TTL_SECONDS = 15 * 60  # 15 minutes
 # BDO category IDs
 COOKING_MAIN_CATEGORY = "35"   # Cooking in arsha.io V2 category mapping
 ALCHEMY_MAIN_CATEGORY = "45"   # Alchemy
+CRAFTING_CATEGORY_SUBCATEGORIES = {
+    COOKING_MAIN_CATEGORY: ("1", "2", "3"),
+    ALCHEMY_MAIN_CATEGORY: ("1", "2", "3"),
+}
+CATEGORY_NAMES = {
+    COOKING_MAIN_CATEGORY: "Cooking",
+    ALCHEMY_MAIN_CATEGORY: "Alchemy",
+}
+
+LOGGER = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Cache helpers
@@ -35,15 +45,15 @@ def _cache_path(key: str) -> Path:
     return CACHE_DIR / f"{key}.json"
 
 
-def _read_cache(key: str) -> Optional[dict]:
+def _read_cache_entry(key: str) -> Optional[dict]:
     """
-    Read cached data if it exists and is fresher than CACHE_TTL_SECONDS.
+    Read a cached wrapper if it exists and is fresher than CACHE_TTL_SECONDS.
 
     Args:
         key: A unique string identifying this cached response.
 
     Returns:
-        The cached data as a dict/list, or None if stale or missing.
+        The cached wrapper dict, or None if stale or missing.
     """
     path = _cache_path(key)
     if not path.exists():
@@ -59,19 +69,48 @@ def _read_cache(key: str) -> Optional[dict]:
     if time.time() - cached_at > CACHE_TTL_SECONDS:
         return None  # stale
 
+    return wrapper
+
+
+def _read_cache(key: str) -> Optional[Any]:
+    """
+    Read cached data if it exists and is fresher than CACHE_TTL_SECONDS.
+
+    Args:
+        key: A unique string identifying this cached response.
+
+    Returns:
+        The cached data as a dict/list, or None if stale or missing.
+    """
+    wrapper = _read_cache_entry(key)
+    if wrapper is None:
+        return None
     return wrapper.get("data")
 
 
-def _write_cache(key: str, data: Any) -> None:
+def _write_cache(
+    key: str,
+    data: Any,
+    source: str = "live",
+    error: Optional[str] = None,
+) -> None:
     """
     Write data to a JSON cache file with the current timestamp.
 
     Args:
         key: A unique string identifying this cached response.
         data: The API response data to cache.
+        source: Where the data came from (live, mock, cached-live, etc.).
+        error: Optional error message that caused a fallback.
     """
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    wrapper = {"cached_at": time.time(), "data": data}
+    wrapper = {
+        "cached_at": time.time(),
+        "fetched_at": datetime.utcnow().isoformat(timespec="seconds"),
+        "source": source,
+        "error": error,
+        "data": data,
+    }
     with open(_cache_path(key), "w", encoding="utf-8") as f:
         json.dump(wrapper, f, indent=2, default=str)
 
@@ -90,15 +129,180 @@ def is_using_live_data(key: str) -> bool:
     Returns True if a valid (non-stale) cache file exists whose data does NOT
     contain the ``_mock`` sentinel flag.
     """
-    data = _read_cache(key)
-    if data is None:
-        return False
-    # Mock payloads are tagged with "_mock": True at the top level
-    if isinstance(data, dict) and data.get("_mock"):
-        return False
-    if isinstance(data, list) and data and isinstance(data[0], dict) and data[0].get("_mock"):
+    status = get_data_status(key)
+    if status["source"] != "live":
         return False
     return True
+
+
+def get_data_status(key: str) -> dict[str, Any]:
+    """
+    Return cache/source metadata for a cached dataset.
+
+    Args:
+        key: A cache key such as ``hot_items`` or ``cooking_items``.
+
+    Returns:
+        A small dict with source, fetched_at, cached_at, and error fields.
+    """
+    wrapper = _read_cache_entry(key)
+    if wrapper is None:
+        return {
+            "key": key,
+            "source": "unknown",
+            "fetched_at": None,
+            "cached_at": None,
+            "error": None,
+        }
+
+    source = wrapper.get("source")
+    data = wrapper.get("data")
+    if source is None:
+        source = "mock" if _contains_mock_data(data) else "live"
+
+    return {
+        "key": key,
+        "source": source,
+        "fetched_at": wrapper.get("fetched_at"),
+        "cached_at": wrapper.get("cached_at"),
+        "error": wrapper.get("error"),
+    }
+
+
+def _contains_mock_data(data: Any) -> bool:
+    """Return True when cached data carries the mock sentinel."""
+    if isinstance(data, dict):
+        return bool(data.get("_mock"))
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        return bool(data[0].get("_mock"))
+    return False
+
+
+def _as_dict(item: Any) -> dict[str, Any]:
+    """Convert dict-like or object-like API payload items into dictionaries."""
+    if isinstance(item, dict):
+        return item
+    if hasattr(item, "to_dict"):
+        return item.to_dict()
+    if hasattr(item, "dict"):
+        return item.dict()
+    if hasattr(item, "__dict__"):
+        return vars(item)
+    return {"raw": item}
+
+
+def _first_value(item: dict[str, Any], aliases: tuple[str, ...], default: Any = None) -> Any:
+    """Return the first present, non-empty field from a list of aliases."""
+    for alias in aliases:
+        value = item.get(alias)
+        if value not in (None, ""):
+            return value
+    return default
+
+
+def _to_int(value: Any, default: int = 0) -> int:
+    """Safely convert API values to integers."""
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_item(
+    item: Any,
+    *,
+    source: str,
+    category_id: Optional[str] = None,
+    sub_category_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Normalize a raw API or mock item into the dashboard's internal schema.
+
+    The external API can expose different names for the same concept, so this
+    function keeps the rest of the app stable by mapping aliases into one shape.
+    """
+    raw = _as_dict(item)
+    main_category = str(_first_value(raw, ("mainCategory", "main_category"), category_id) or "")
+    sub_category = str(_first_value(raw, ("subCategory", "sub_category"), sub_category_id) or "")
+    item_id = _to_int(_first_value(raw, ("id", "itemId", "item_id", "mainKey", "main_key")))
+    sid = _to_int(_first_value(raw, ("sid", "subKey", "sub_key", "enhancementLevel"), 0))
+    total_trade_count = _to_int(
+        _first_value(raw, ("totalTradeCount", "totalTrades", "total_trades", "totalTrade"), 0)
+    )
+    trade_count = _to_int(
+        _first_value(raw, ("tradeCount", "trade_count", "recentTradeCount"), total_trade_count)
+    )
+
+    normalized = {
+        "_mock": bool(raw.get("_mock")) or source == "mock",
+        "id": item_id,
+        "sid": sid,
+        "name": _first_value(raw, ("name", "itemName", "item_name"), f"Item {item_id}"),
+        "mainCategory": _to_int(main_category),
+        "mainCategoryName": CATEGORY_NAMES.get(main_category, main_category or "Unknown"),
+        "subCategory": _to_int(sub_category),
+        "minPrice": _to_int(
+            _first_value(raw, ("minPrice", "basePrice", "base_price", "price", "currentPrice"), 0)
+        ),
+        "tradeCount": trade_count,
+        "currentStock": _to_int(_first_value(raw, ("currentStock", "current_stock", "stock"), 0)),
+        "totalTradeCount": total_trade_count,
+        "source": source,
+    }
+    if "priceHistory" in raw:
+        normalized["priceHistory"] = raw["priceHistory"]
+    return normalized
+
+
+def _normalize_items(
+    items: list[Any],
+    *,
+    source: str,
+    category_id: Optional[str] = None,
+    sub_category_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Normalize and de-duplicate a list of raw market items."""
+    normalized = [
+        _normalize_item(
+            item,
+            source=source,
+            category_id=category_id,
+            sub_category_id=sub_category_id,
+        )
+        for item in items
+    ]
+    deduped: dict[tuple[int, int], dict[str, Any]] = {}
+    for item in normalized:
+        deduped[(item["id"], item["sid"])] = item
+    return list(deduped.values())
+
+
+def _normalize_history(data: Any, item_id: int, source: str) -> dict[str, Any]:
+    """Normalize supported price-history payload shapes into ``history``."""
+    if isinstance(data, dict) and "history" in data:
+        return {**data, "_mock": source == "mock" or bool(data.get("_mock")), "itemId": item_id}
+
+    raw = data
+    if isinstance(data, list) and len(data) == 1:
+        raw = data[0]
+    raw_dict = _as_dict(raw)
+
+    history = raw_dict.get("history") or raw_dict.get("prices") or raw_dict.get("priceHistory")
+    if isinstance(history, list):
+        converted = {}
+        for row in history:
+            row_dict = _as_dict(row)
+            date = _first_value(row_dict, ("date", "time", "timestamp"))
+            price = _first_value(row_dict, ("price", "basePrice", "minPrice"))
+            if date is not None and price is not None:
+                converted[str(date)] = _to_int(price)
+        history = converted
+
+    return {
+        "_mock": source == "mock" or bool(raw_dict.get("_mock")),
+        "history": history if isinstance(history, dict) else {},
+        "itemId": item_id,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -191,14 +395,21 @@ async def _fetch_hot_items() -> list[dict]:
 
         if response.success and response.content:
             data = response.content if isinstance(response.content, list) else [response.content]
-            _write_cache(cache_key, data)
-            return data
-    except Exception:
-        pass  # fall through to mock
+            normalized = _normalize_items(data, source="live")
+            _write_cache(cache_key, normalized, source="live")
+            return normalized
+    except Exception as exc:
+        # Keep the dashboard usable, but record the error so it is visible in
+        # the UI and useful while debugging API or network issues.
+        error = f"{type(exc).__name__}: {exc}"
+        LOGGER.warning("Failed to fetch hot items from arsha.io: %s", error)
+    else:
+        error = "Live API returned no hot-item content."
+        LOGGER.warning(error)
 
     # Fallback: mock data
-    mock = _mock_hot_items()
-    _write_cache(cache_key, mock)
+    mock = _normalize_items(_mock_hot_items(), source="mock")
+    _write_cache(cache_key, mock, source="mock", error=error)
     return mock
 
 
@@ -223,20 +434,38 @@ async def _fetch_cooking_items() -> list[dict]:
             apiversion=ApiVersion.V2,
             language=Locale.English,
         ) as market:
-            for cat in (COOKING_MAIN_CATEGORY, ALCHEMY_MAIN_CATEGORY):
-                resp = await market.get_world_market_list(main_category=cat, sub_category="1")
-                if resp.success and resp.content:
-                    items = resp.content if isinstance(resp.content, list) else [resp.content]
-                    combined.extend(items)
+            # Fetch a small configured set of useful subcategories rather than
+            # only subcategory 1. This gives a broader Cooking/Alchemy view
+            # while keeping the number of API calls controlled.
+            for cat, sub_categories in CRAFTING_CATEGORY_SUBCATEGORIES.items():
+                for sub_category in sub_categories:
+                    resp = await market.get_world_market_list(
+                        main_category=cat,
+                        sub_category=sub_category,
+                    )
+                    if resp.success and resp.content:
+                        items = resp.content if isinstance(resp.content, list) else [resp.content]
+                        combined.extend(
+                            _normalize_items(
+                                items,
+                                source="live",
+                                category_id=cat,
+                                sub_category_id=sub_category,
+                            )
+                        )
 
         if combined:
-            _write_cache(cache_key, combined)
+            _write_cache(cache_key, combined, source="live")
             return combined
-    except Exception:
-        pass
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        LOGGER.warning("Failed to fetch Cooking/Alchemy items from arsha.io: %s", error)
+    else:
+        error = "Live API returned no Cooking/Alchemy content."
+        LOGGER.warning(error)
 
-    mock = _mock_cooking_items()
-    _write_cache(cache_key, mock)
+    mock = _normalize_items(_mock_cooking_items(), source="mock")
+    _write_cache(cache_key, mock, source="mock", error=error)
     return mock
 
 
@@ -271,14 +500,18 @@ async def _fetch_item_history(item_id: int, enhancement_level: int = 0) -> dict:
             )
 
         if resp.success and resp.content:
-            data = resp.content if isinstance(resp.content, dict) else {"history": resp.content}
-            _write_cache(cache_key, data)
+            data = _normalize_history(resp.content, item_id=item_id, source="live")
+            _write_cache(cache_key, data, source="live")
             return data
-    except Exception:
-        pass
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        LOGGER.warning("Failed to fetch item history from arsha.io: %s", error)
+    else:
+        error = f"Live API returned no price-history content for item {item_id}."
+        LOGGER.warning(error)
 
-    mock = _mock_item_history(item_id)
-    _write_cache(cache_key, mock)
+    mock = _normalize_history(_mock_item_history(item_id), item_id=item_id, source="mock")
+    _write_cache(cache_key, mock, source="mock", error=error)
     return mock
 
 
