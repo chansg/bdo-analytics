@@ -13,6 +13,9 @@ __pycache__/
 # Cache data (regenerated at runtime)
 bdo-intelligence/data/cache/*.json
 
+# Local user preferences (personal machine state)
+bdo-intelligence/data/watchlist.json
+
 # OS files
 .DS_Store
 Thumbs.db

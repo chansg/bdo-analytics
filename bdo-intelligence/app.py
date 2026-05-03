@@ -41,12 +41,20 @@ from api.market import (
     summarize_data_health,
 )
 from analytics.best_sellers import enrich_items
+from services.watchlist import (
+    add_to_watchlist,
+    load_watchlist,
+    make_item_key,
+    remove_from_watchlist,
+    save_watchlist,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 BEST_SELLER_GREEN = 70
 BEST_SELLER_AMBER = 40
+EXPORT_MIME_TYPE = "text/csv"
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -193,6 +201,102 @@ def _format_styled_table(styled, formatters: dict) -> object:
     return styled.format(formatters, na_rep="N/A")
 
 
+def _add_item_keys(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add stable watchlist keys to a market DataFrame.
+
+    Streamlit re-runs the script after every click. A stable ``itemKey`` lets
+    the app remember "Beer +0" even when row positions or sorting changes.
+    """
+    if df.empty or "id" not in df.columns:
+        return df.copy()
+
+    keyed = df.copy()
+    if "sid" not in keyed.columns:
+        keyed["sid"] = 0
+
+    keyed["itemKey"] = [
+        make_item_key(item_id, sid)
+        for item_id, sid in zip(keyed["id"], keyed["sid"], strict=False)
+    ]
+    return keyed
+
+
+def _build_item_catalog(*frames: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build one item picker source from all loaded market tables.
+
+    Cooking/Alchemy rows are passed first because they usually contain richer
+    score columns than Hot Items. Duplicate item keys keep that richer row.
+    """
+    prepared = []
+    for source_name, frame in frames:
+        if frame.empty:
+            continue
+        copy = _add_item_keys(frame)
+        copy["watchlistSource"] = source_name
+        prepared.append(copy)
+
+    if not prepared:
+        return pd.DataFrame()
+
+    catalog = pd.concat(prepared, ignore_index=True)
+    catalog = catalog.drop_duplicates(subset=["itemKey"], keep="first")
+    catalog["watchlistLabel"] = catalog.apply(_watchlist_label_from_row, axis=1)
+    return catalog.sort_values("watchlistLabel").reset_index(drop=True)
+
+
+def _watchlist_label_from_row(row: pd.Series) -> str:
+    """
+    Return a readable picker label for one market item row.
+
+    The label includes category and item key so two same-name items can still be
+    told apart if enhancement levels are added later.
+    """
+    category = row.get("mainCategoryName") or "Unknown"
+    name = row.get("name") or f"Item {row.get('id', 'Unknown')}"
+    return f"{name} — {category} ({row.get('itemKey', 'unknown')})"
+
+
+def _labels_for_keys(catalog: pd.DataFrame, item_keys: list[str]) -> dict[str, str]:
+    """
+    Map saved watchlist keys to human-readable labels.
+
+    Some saved keys may not be present in the current live API response. Those
+    still get a fallback label so the user can remove them if needed.
+    """
+    if catalog.empty:
+        return {key: key for key in item_keys}
+
+    label_by_key = dict(zip(catalog["itemKey"], catalog["watchlistLabel"], strict=False))
+    return {key: label_by_key.get(key, key) for key in item_keys}
+
+
+def _filter_watchlist_items(catalog: pd.DataFrame, item_keys: list[str]) -> pd.DataFrame:
+    """
+    Return catalog rows that match the saved watchlist keys.
+
+    The categorical ordered dtype keeps the table in the same order the player
+    added items instead of whatever order the market API returns today.
+    """
+    if catalog.empty or not item_keys:
+        return pd.DataFrame()
+
+    watched = catalog[catalog["itemKey"].isin(item_keys)].copy()
+    watched["itemKey"] = pd.Categorical(watched["itemKey"], categories=item_keys, ordered=True)
+    return watched.sort_values("itemKey").reset_index(drop=True)
+
+
+def _csv_bytes(df: pd.DataFrame) -> bytes:
+    """
+    Convert a DataFrame into downloadable CSV bytes.
+
+    Keeping this tiny helper central means every export button behaves the same
+    way and is easy to test manually.
+    """
+    return df.to_csv(index=False).encode("utf-8")
+
+
 # ---------------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------------
@@ -201,8 +305,8 @@ st.caption("Cooking & Alchemy · Live Data via arsha.io")
 
 # Load the two main datasets before showing source status. This keeps the
 # LIVE/MOCK badge tied to the actual data on screen.
-hot_df = load_hot_items()
-cook_df = load_cooking_items()
+hot_df = _add_item_keys(load_hot_items())
+cook_df = _add_item_keys(load_cooking_items())
 hot_status = get_data_status("hot_items")
 cooking_status = get_data_status("cooking_items")
 endpoint_statuses = [
@@ -212,12 +316,54 @@ endpoint_statuses = [
 _show_data_status(endpoint_statuses)
 st.sidebar.caption(f"Last data fetch: {_latest_fetch_time(hot_status, cooking_status)}")
 
+# The catalog powers the sidebar picker and the Watchlist tab. Cooking/Alchemy
+# is passed first because those rows include the best-seller analytics.
+item_catalog = _build_item_catalog(
+    ("Cooking / Alchemy", cook_df),
+    ("Hot Items", hot_df),
+)
+watchlist_keys = load_watchlist()
+
+with st.sidebar.expander("⭐ Watchlist", expanded=True):
+    if item_catalog.empty:
+        st.caption("No market items are loaded yet.")
+    else:
+        option_by_label = dict(
+            zip(item_catalog["watchlistLabel"], item_catalog["itemKey"], strict=False)
+        )
+        selected_label = st.selectbox("Add item", list(option_by_label.keys()))
+
+        if st.button("Add to Watchlist"):
+            watchlist_keys = add_to_watchlist(watchlist_keys, option_by_label[selected_label])
+            save_watchlist(watchlist_keys)
+            st.success("Item added.")
+            st.rerun()
+
+    if watchlist_keys:
+        labels_by_key = _labels_for_keys(item_catalog, watchlist_keys)
+        remove_labels = st.multiselect("Remove item(s)", list(labels_by_key.values()))
+        key_by_label = {label: key for key, label in labels_by_key.items()}
+
+        if st.button("Remove Selected"):
+            selected_keys = [key_by_label[label] for label in remove_labels]
+            watchlist_keys = remove_from_watchlist(watchlist_keys, selected_keys)
+            save_watchlist(watchlist_keys)
+            st.success("Watchlist updated.")
+            st.rerun()
+
+    st.caption(f"{len(watchlist_keys)} saved item(s)")
+
 
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
-tab_hot, tab_cooking, tab_history = st.tabs(
-    ["🔥 Hot Items Leaderboard", "🍳 Cooking / Alchemy Browser", "📈 Price History"]
+tab_hot, tab_cooking, tab_history, tab_watchlist = st.tabs(
+    [
+        "🔥 Hot Items Leaderboard",
+        "🍳 Cooking / Alchemy Browser",
+        "📈 Price History",
+        "⭐ Watchlist",
+    ]
 )
 
 # ----- Tab 1: Hot Items Leaderboard ----------------------------------------
@@ -268,6 +414,12 @@ with tab_hot:
             },
         )
         st.dataframe(styled, width="stretch", hide_index=True)
+        st.download_button(
+            "Download Hot Items CSV",
+            data=_csv_bytes(display),
+            file_name="bdo_hot_items_eu.csv",
+            mime=EXPORT_MIME_TYPE,
+        )
 
 
 # ----- Tab 2: Cooking / Alchemy Browser -----------------------------------
@@ -275,20 +427,22 @@ with tab_cooking:
     if cook_df.empty:
         st.info("No Cooking / Alchemy data available.")
     else:
+        filtered_cook_df = cook_df.copy()
+
         # Optional sub-category filter
         if "subCategory" in cook_df.columns:
             sub_cats = ["All"] + sorted(cook_df["subCategory"].dropna().unique().tolist())
             chosen = st.selectbox("Filter by sub-category", sub_cats)
             if chosen != "All":
-                cook_df = cook_df[cook_df["subCategory"] == chosen]
+                filtered_cook_df = filtered_cook_df[filtered_cook_df["subCategory"] == chosen]
 
         # Columns for display
         cols_wanted = [
             "name", "minPrice", "volumeScore", "priceStability",
             "turnoverRate", "bestSellerScore", "anomalyStatus",
         ]
-        cols_present = [c for c in cols_wanted if c in cook_df.columns]
-        display = cook_df[cols_present].copy()
+        cols_present = [c for c in cols_wanted if c in filtered_cook_df.columns]
+        display = filtered_cook_df[cols_present].copy()
 
         rename_map = {
             "name": "Item Name",
@@ -329,6 +483,12 @@ with tab_cooking:
             },
         )
         st.dataframe(styled, width="stretch", hide_index=True)
+        st.download_button(
+            "Download Cooking / Alchemy CSV",
+            data=_csv_bytes(display),
+            file_name="bdo_cooking_alchemy_eu.csv",
+            mime=EXPORT_MIME_TYPE,
+        )
 
 
 # ----- Tab 3: Price History ------------------------------------------------
@@ -395,3 +555,68 @@ with tab_history:
                 template="plotly_white",
             )
             st.plotly_chart(fig, width="stretch")
+
+
+# ----- Tab 4: Watchlist ----------------------------------------------------
+with tab_watchlist:
+    watched_df = _filter_watchlist_items(item_catalog, watchlist_keys)
+
+    if not watchlist_keys:
+        st.info("Your watchlist is empty. Add items from the sidebar to track them here.")
+    elif watched_df.empty:
+        st.warning(
+            "Your saved watchlist items are not present in the currently loaded market data."
+        )
+    else:
+        missing_keys = sorted(set(watchlist_keys) - set(watched_df["itemKey"].astype(str)))
+        if missing_keys:
+            st.warning(
+                "Some saved items are not present in the current market response: "
+                + ", ".join(missing_keys)
+            )
+
+        cols_wanted = [
+            "name",
+            "watchlistSource",
+            "mainCategoryName",
+            "minPrice",
+            "tradeCount",
+            "currentStock",
+            "volumeScore",
+            "bestSellerScore",
+            "anomalyStatus",
+        ]
+        cols_present = [column for column in cols_wanted if column in watched_df.columns]
+        display = watched_df[cols_present].copy()
+
+        rename_map = {
+            "name": "Item Name",
+            "watchlistSource": "Source",
+            "mainCategoryName": "Category",
+            "minPrice": "Price",
+            "tradeCount": "Trade Count",
+            "currentStock": "Current Stock",
+            "volumeScore": "Volume Score",
+            "bestSellerScore": "Best Seller Score",
+            "anomalyStatus": "Anomaly Status",
+        }
+        display = display.rename(columns=rename_map)
+
+        st.metric("Watched Items", len(watched_df))
+        styled = _format_styled_table(
+            display.style,
+            {
+                "Price": "{:,.0f}",
+                "Trade Count": "{:,.0f}",
+                "Current Stock": "{:,.0f}",
+                "Volume Score": "{:.2f}",
+                "Best Seller Score": "{:.2f}",
+            },
+        )
+        st.dataframe(styled, width="stretch", hide_index=True)
+        st.download_button(
+            "Download Watchlist CSV",
+            data=_csv_bytes(display),
+            file_name="bdo_watchlist_eu.csv",
+            mime=EXPORT_MIME_TYPE,
+        )
