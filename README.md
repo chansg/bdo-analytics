@@ -50,6 +50,11 @@ The dashboard will open in your browser at `http://localhost:8501`.
 | **Hot Items Leaderboard** | Currently trending items across all categories, with anomaly highlighting |
 | **Cooking / Alchemy Browser** | All Cooking & Alchemy items ranked by a composite Best Seller Score |
 | **Price History** | Interactive price chart with 7-day moving average for any Cooking/Alchemy item |
+| **Watchlist** | Locally saved items you want to monitor, with CSV export for follow-up analysis |
+
+The Hot Items, Cooking/Alchemy, and Watchlist tables can be downloaded as CSV
+files. This makes it easy to move the same market snapshot into Excel, Power BI,
+or a Jupyter notebook for deeper analysis.
 
 ## Score Glossary
 
@@ -66,6 +71,8 @@ The dashboard will open in your browser at `http://localhost:8501`.
 All data comes from [arsha.io](https://arsha.io), a community-maintained proxy for the BDO Central Market API. No login or API key is required.
 
 - API responses are cached locally for 15 minutes (in `data/cache/`)
+- Your personal watchlist is saved locally in `bdo-intelligence/data/watchlist.json`
+  and is intentionally ignored by Git
 - If arsha.io is unreachable, the dashboard falls back to realistic mock data so you can still explore the interface
 - Some live EU endpoints can temporarily fail when Pearl Abyss blocks upstream
   requests through Imperva. This is an upstream data-source issue, not a missing
@@ -80,8 +87,11 @@ bdo-intelligence/
 │   └── market.py           # API wrapper with caching + mock fallback
 ├── analytics/
 │   └── best_sellers.py     # Scoring and anomaly detection
+├── services/
+│   └── watchlist.py        # Local watchlist persistence
 ├── data/
-│   └── cache/              # Auto-generated JSON cache files
+│   ├── cache/              # Auto-generated JSON cache files
+│   └── watchlist.json      # Local-only user watchlist, ignored by Git
 └── README.md
 ```
 
